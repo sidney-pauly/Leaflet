@@ -72,6 +72,7 @@ export var Events = {
 		if (!types) {
 			// clear all listeners if called without arguments
 			delete this._events;
+			delete this._eventsOrdering;
 
 		} else if (typeof types === 'object') {
 			for (var type in types) {
@@ -92,12 +93,19 @@ export var Events = {
 	// attach listener (without syntactic sugar now)
 	_on: function (type, fn, context) {
 		this._events = this._events || {};
+		this._eventsOrdering = this._eventsOrdering || {};
 
 		/* get/init listeners for type */
 		var typeListeners = this._events[type];
 		if (!typeListeners) {
-			typeListeners = [];
+			typeListeners = {};
 			this._events[type] = typeListeners;
+		}
+
+		var ordering = this._eventsOrdering[type];
+		if (!ordering) {
+			ordering = [];
+			this._eventsOrdering[type] = ordering;
 		}
 
 		if (context === this) {
@@ -107,14 +115,29 @@ export var Events = {
 		var newListener = {fn: fn, ctx: context},
 		    listeners = typeListeners;
 
-		// check if fn already there
-		for (var i = 0, len = listeners.length; i < len; i++) {
-			if (listeners[i].fn === fn && listeners[i].ctx === context) {
-				return;
+		// Stamp the function to remove it faster
+		var fnId = Util.stamp(fn);
+		if(context){
+			var contextId = Util.stamp(context);
+		}
+		
+
+		//Combine context id and fn id
+		var fullId = fnId + '*' + contextId;
+
+		// Clear the event from the fire ordering if it was prviosly removed
+		if(listeners && listeners[fullId] && listeners[fullId].removed){
+			var exsitingCall = ordering.indexOf(fullId);
+			if(exsitingCall > -1){
+				ordering.splice(exsitingCall, 1)
 			}
 		}
 
-		listeners.push(newListener);
+		//Only add if not already added
+		if(!listeners[fullId]){
+			listeners[fullId] = newListener;
+			ordering.push(fullId);
+		}
 	},
 
 	_off: function (type, fn, context) {
@@ -132,11 +155,12 @@ export var Events = {
 
 		if (!fn) {
 			// Set all removed listeners to noop so they are not called if remove happens in fire
-			for (i = 0, len = listeners.length; i < len; i++) {
-				listeners[i].fn = Util.falseFn;
+			var listenerKeys = Object.keys(listeners);
+			for (i = 0; i < listenerKeys.length; i++) {
+				listeners[listenerKeys[i]] = {removed: true};
 			}
 			// clear all listeners for a type if function isn't specified
-			delete this._events[type];
+			// delete this._events[type];
 			return;
 		}
 
@@ -145,25 +169,9 @@ export var Events = {
 		}
 
 		if (listeners) {
-
-			// find fn and remove it
-			for (i = 0, len = listeners.length; i < len; i++) {
-				var l = listeners[i];
-				if (l.ctx !== context) { continue; }
-				if (l.fn === fn) {
-
-					// set the removed listener to noop so that's not called if remove happens in fire
-					l.fn = Util.falseFn;
-
-					if (this._firingCount) {
-						/* copy array in case events are being fired */
-						this._events[type] = listeners = listeners.slice();
-					}
-					listeners.splice(i, 1);
-
-					return;
-				}
-			}
+			var contextId = context ? context._leaflet_id : undefined;
+			var id = fn._leaflet_id + '*' + contextId;
+			this._events[type][id] = {removed: true};
 		}
 	},
 
@@ -185,11 +193,24 @@ export var Events = {
 
 			if (listeners) {
 				this._firingCount = (this._firingCount + 1) || 1;
-				for (var i = 0, len = listeners.length; i < len; i++) {
-					var l = listeners[i];
-					l.fn.call(l.ctx || this, event);
+				var ordering = this._eventsOrdering[type];;
+				for (var i = 0; i < ordering.length; i++) {
+					var id = ordering[i];
+					var l = listeners[id];
+					//Only call if if event was not removed
+					if(!l.removed){
+						l.fn.call(l.ctx || this, event);
+					}
+					//If it was removed clean it up (Doing this here improves performance)
+					else{
+						var continueSearch = i < ordering.length-1;
+						ordering.splice(i, 1);
+						//Repeat the index if the event wasn't the last one
+						if(continueSearch){
+							i--;
+						}
+					}
 				}
-
 				this._firingCount--;
 			}
 		}
@@ -205,8 +226,24 @@ export var Events = {
 	// @method listens(type: String): Boolean
 	// Returns `true` if a particular event type has any listeners attached to it.
 	listens: function (type, propagate) {
-		var listeners = this._events && this._events[type];
-		if (listeners && listeners.length) { return true; }
+		var ordering = this._eventsOrdering && this._eventsOrdering[type];
+		if (ordering) { 
+			var i = 0;
+			while(i < ordering.length){
+				//Return true if the event was not yet removed
+				if(!this._events[type][ordering[i]].removed) { return true; }
+				//Remove the event from the ordering and continue searching (doing this here improves performance)
+				else {
+					var continueSearch = i < ordering.length-1;
+					ordering.splice(i, 1);
+					//Repeat the index if the event wasn't the last one
+					if(!continueSearch){
+						break;
+					}
+				}
+			}
+			
+		 }
 
 		if (propagate) {
 			// also check parents for listeners if event propagates
